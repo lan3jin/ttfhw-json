@@ -193,6 +193,16 @@ XSS_PATTERNS = [
     (r'eval\s*\(', "eval() call"),
 ]
 
+# AI prompt injection patterns (injected into JSON text fields to manipulate AI analysis)
+PROMPT_INJECTION_PATTERNS = [
+    (r'ignore\s+(all\s+)?(previous|above|prior)\s+(instructions?|prompts?|directives?)', "AI prompt override", re.IGNORECASE),
+    (r'you\s+are\s+(now|no\s+longer)\b.{0,50}\b(assistant|validator|checker)', "AI role hijack", re.IGNORECASE),
+    (r'system\s*(prompt|message|instruction)\s*(:|is|was|now)\s*["\']?', "system prompt injection", re.IGNORECASE),
+    (r'do\s+not\s+(check|validate|analyze|report|flag)\b', "suppression instruction", re.IGNORECASE),
+    (r'output\s+(only|just|exactly)\s*["\']?\{\}', "output suppression", re.IGNORECASE),
+    (r'\[INST\]|\[/INST\]|<<SYS>>|<</SYS>>', "LLM instruction tags", re.IGNORECASE),
+]
+
 # Sensitive information patterns
 SENSITIVE_INFO_PATTERNS = [
     (r'sk-[a-zA-Z0-9]{32,}', "OpenAI/Anthropic API key"),
@@ -709,7 +719,18 @@ def check_security_injection(data: dict, filepath: str, issues: IssueCollector):
                            f"XSS pattern detected: {desc} in value '{_truncate(value, 100)}'")
                 break  # one XSS issue per field
 
-        # --- Check 2: Shell injection (NON-command fields only) ---
+        # --- Check 2: AI prompt injection (ALL fields, especially text) ---
+        for pattern, desc, *flags in PROMPT_INJECTION_PATTERNS:
+            kw = {}
+            if flags and flags[0] is re.IGNORECASE:
+                kw["flags"] = re.IGNORECASE
+            if re.search(pattern, value, **kw):
+                issues.add("error", "security_prompt_injection", full_path,
+                           f"AI prompt injection detected: {desc} — "
+                           f"'{_truncate(value, 100)}'")
+                break
+
+        # --- Check 3: Shell injection (NON-command fields only) ---
         if not is_cmd_field:
             for pattern, desc in SHELL_INJECTION_PATTERNS:
                 if re.search(pattern, value):

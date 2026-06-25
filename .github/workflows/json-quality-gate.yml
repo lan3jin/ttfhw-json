@@ -29,7 +29,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install anthropic
+        run: pip install openai
 
       - name: Get changed JSON files
         id: changed-files
@@ -55,7 +55,7 @@ jobs:
         id: ai-check
         continue-on-error: true
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         run: |
           python3 scripts/ai_quality_check.py ${{ steps.changed-files.outputs.all_changed_files }} > /tmp/ai_results.json
           cat /tmp/ai_results.json

@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-TTFHW JSON Quality Gate — AI Semantic Analysis Script.
+TTFHW JSON Quality Gate — AI Semantic Analysis Script (DeepSeek v4-pro).
 
-Uses the Anthropic API to perform semantic checks on verification report JSON
-files that cannot be done with deterministic rules alone. This includes:
+Uses the DeepSeek API (OpenAI-compatible) with reasoning/thinking enabled to
+perform semantic checks on verification report JSON files that cannot be done
+with deterministic rules alone.
+
+Checks:
 - Chinese status value consistency
 - failure_reason quality assessment
 - documentation_gaps specificity
@@ -11,7 +14,7 @@ files that cannot be done with deterministic rules alone. This includes:
 - Process timeline details coherence
 
 Usage:
-    export ANTHROPIC_API_KEY=sk-...
+    export DEEPSEEK_API_KEY=sk-...
     python ai_quality_check.py reports/file1.json [reports/file2.json ...]
 
 Output: JSON to stdout with structure:
@@ -20,12 +23,54 @@ Output: JSON to stdout with structure:
 
 import json
 import os
+import re
 import sys
-from typing import Any, Dict, List, Optional
+import zlib
+from typing import Any, Dict, List, Optional, Tuple
 
 
 # ---------------------------------------------------------------------------
-# Prompt templates
+# Token injection / token-bomb protection constants
+# ---------------------------------------------------------------------------
+
+# Hard limit: reject files larger than this (1 MB)
+MAX_FILE_SIZE_BYTES = 1_000_000
+
+# Hard limit: reject any single string value longer than this (50K chars)
+MAX_STRING_LENGTH = 50_000
+
+# Hard limit: the focused content sent to the AI must not exceed this (~60K chars)
+# DeepSeek v4-pro has a large context window, but we keep it tight per file
+MAX_FOCUSED_CONTENT_CHARS = 60_000
+
+# If any string value repeats the same substring to pad tokens
+# (e.g., "aaaa...aaaa" repeated 5000 times), flag as suspicious
+MAX_REPETITION_RATIO = 0.3  # if >30% of the content is one repeating pattern
+
+# Minimum estimated token count that triggers a hard rejection
+MAX_ESTIMATED_TOKENS = 30_000
+
+# Suspicious prompt-injection patterns in text fields
+PROMPT_INJECTION_PATTERNS = [
+    (re.compile(r'ignore\s+(all\s+)?(previous|above|prior)\s+(instructions?|prompts?|directives?)',
+                re.IGNORECASE), "prompt override attempt"),
+    (re.compile(r'you\s+are\s+(now|no\s+longer)\b.{0,50}\b(assistant|validator|checker)',
+                re.IGNORECASE), "role hijack attempt"),
+    (re.compile(r'system\s*(prompt|message|instruction)\s*(:|is|was|now)\s*["\']?',
+                re.IGNORECASE), "system prompt injection"),
+    (re.compile(r'do\s+not\s+(check|validate|analyze|report|flag)\b',
+                re.IGNORECASE), "suppression instruction"),
+    (re.compile(r'output\s+(only|just|exactly)\s*["\']?\{\}', re.IGNORECASE),
+     "output suppression attempt"),
+    (re.compile(r'\[INST\]|\[/INST\]|<<SYS>>|<</SYS>>', re.IGNORECASE),
+     "LLM instruction tags"),
+    (re.compile(r'\]\(javascript:', re.IGNORECASE),
+     "markdown XSS in content"),
+]
+
+
+# ---------------------------------------------------------------------------
+# System prompt for DeepSeek
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = """你是一个 TTFHW 验证报告 JSON 质量检查专家。你的任务是分析 JSON 验证报告中的语义一致性问题。
@@ -110,10 +155,158 @@ SYSTEM_PROMPT = """你是一个 TTFHW 验证报告 JSON 质量检查专家。你
 """
 
 
-def build_user_prompt(filepath: str, data: dict) -> str:
-    """Build the user prompt with the JSON content to analyze."""
-    # Extract a focused subset for the AI to analyze (avoid token waste on
-    # large execution_log outputs)
+# ---------------------------------------------------------------------------
+# Token injection protection
+# ---------------------------------------------------------------------------
+
+def check_file_size(filepath: str) -> Optional[str]:
+    """Check file is not too large. Returns error message if rejected."""
+    size = os.path.getsize(filepath)
+    if size > MAX_FILE_SIZE_BYTES:
+        return (f"File too large: {size / 1_000_000:.1f}MB (limit: "
+                f"{MAX_FILE_SIZE_BYTES / 1_000_000:.0f}MB). "
+                f"Rejected for token-bomb protection.")
+    return None
+
+
+def estimate_tokens(text: str) -> int:
+    """Rough token estimation: ~1 token per 3 chars for Chinese, 4 chars for English.
+    This is a conservative heuristic for DeepSeek's tokenizer."""
+    # Count CJK characters (they use more tokens per char)
+    cjk_chars = len(re.findall(r'[一-鿿　-〿＀-￯]', text))
+    other_chars = len(text) - cjk_chars
+    # CJK: ~1.5 chars/token, Other: ~4 chars/token (conservative)
+    return int(cjk_chars / 1.2 + other_chars / 3.5)
+
+
+def check_string_repetition(s: str) -> Optional[str]:
+    """Check if a string contains suspiciously repetitive content.
+    Returns description if suspicious, None if OK."""
+    if len(s) < 200:
+        return None
+
+    # Compress with zlib — if compression ratio is extreme, content is repetitive
+    try:
+        original = s.encode('utf-8')
+        compressed = zlib.compress(original, level=1)
+        ratio = len(compressed) / max(len(original), 1)
+        if ratio < 0.05:  # >95% compression ratio = highly repetitive
+            return (f"Highly repetitive content detected "
+                    f"(compression ratio {ratio:.2%}, likely token padding)")
+    except Exception:
+        pass
+
+    # Check for single-character repetition
+    for ch in set(s[:50]):  # check chars from the beginning
+        if s.count(ch) / len(s) > 0.9 and len(s) > 500:
+            return (f"Single-character repetition pattern detected "
+                    f"(char '{ch}' repeated {s.count(ch)}/{len(s)} times)")
+
+    return None
+
+
+def scan_for_prompt_injection(s: str, json_path: str) -> List[Dict]:
+    """Scan a string value for prompt injection patterns.
+    Returns list of security issues found."""
+    issues = []
+    for pattern, desc in PROMPT_INJECTION_PATTERNS:
+        match = pattern.search(s)
+        if match:
+            ctx_start = max(0, match.start() - 20)
+            ctx_end = min(len(s), match.end() + 20)
+            context = s[ctx_start:ctx_end].replace('\n', ' ')
+            issues.append({
+                "severity": "error",
+                "check": "security_prompt_injection",
+                "path": json_path,
+                "message": f"检测到 AI 提示词注入: {desc} — \"...{context}...\"",
+                "suggestion": "此内容可能试图操纵 AI 分析结果，请移除可疑指令"
+            })
+    return issues
+
+
+def sanitize_str(s: str, max_len: int = MAX_STRING_LENGTH) -> Tuple[str, bool]:
+    """Truncate a string value if it exceeds the maximum length.
+    Returns (sanitized_string, was_truncated)."""
+    if not isinstance(s, str):
+        return str(s), False
+    if len(s) > max_len:
+        return s[:max_len] + f"\n\n[... 已截断，原长度 {len(s)} 字符，超出 AI 分析限制 ...]", True
+    return s, False
+
+
+def build_safe_focused_view(data: dict, filepath: str) -> Tuple[dict, List[Dict]]:
+    """Build a safe, focused subset of the JSON data for AI analysis.
+
+    This function:
+    1. Extracts only the relevant fields (ignoring raw logs)
+    2. Truncates overly long string values
+    3. Checks for prompt injection in all text fields
+    4. Checks for token-bomb patterns (repetition, padding)
+    5. Enforces a total content size limit
+
+    Returns (focused_view, security_issues_found).
+    """
+    security_issues = []
+
+    def _walk_and_protect(obj, path=""):
+        """Recursively walk the data, truncating and scanning strings."""
+        if isinstance(obj, str):
+            # Scan for prompt injection in ALL strings
+            sec = scan_for_prompt_injection(obj, f"$.{path}" if path else "$")
+            security_issues.extend(sec)
+
+            # Check for repetitive/token-padding content
+            rep_issue = check_string_repetition(obj)
+            if rep_issue:
+                security_issues.append({
+                    "severity": "error",
+                    "check": "security_token_bomb",
+                    "path": f"$.{path}" if path else "$",
+                    "message": f"检测到 token 炸弹: {rep_issue}",
+                    "suggestion": "此内容可能是为了消耗 AI token 而构造的膨胀数据"
+                })
+
+            # Truncate long strings
+            sanitized, truncated = sanitize_str(obj)
+            if truncated:
+                security_issues.append({
+                    "severity": "warning",
+                    "check": "security_string_truncated",
+                    "path": f"$.{path}" if path else "$",
+                    "message": f"字符串过长 ({len(obj)} 字符)，已截断至 {MAX_STRING_LENGTH} 字符",
+                    "suggestion": "请检查此字段是否被注入了异常大量的内容"
+                })
+            return sanitized
+
+        elif isinstance(obj, dict):
+            result = {}
+            for k, v in obj.items():
+                child_path = f"{path}.{k}" if path else k
+                result[k] = _walk_and_protect(v, child_path)
+            return result
+
+        elif isinstance(obj, list):
+            # Limit arrays to prevent abuse
+            if len(obj) > 500:
+                security_issues.append({
+                    "severity": "warning",
+                    "check": "security_array_truncated",
+                    "path": f"$.{path}" if path else "$",
+                    "message": f"数组过长 ({len(obj)} 项)，仅保留前 500 项进行分析",
+                    "suggestion": "请检查是否被注入了异常的数组项"
+                })
+                obj = obj[:500]
+            result = []
+            for i, v in enumerate(obj):
+                child_path = f"{path}.{i}" if path else str(i)
+                result.append(_walk_and_protect(v, child_path))
+            return result
+
+        else:
+            return obj
+
+    # Build the focused view (same structure as before)
     focused = {
         "metadata": data.get("metadata", {}),
         "machine_spec": {
@@ -144,57 +337,71 @@ def build_user_prompt(filepath: str, data: dict) -> str:
             ],
         },
     }
-    return f"请分析以下验证报告 JSON 的语义质量问题：\n\n文件: {filepath}\n\n{json.dumps(focused, indent=2, ensure_ascii=False)}"
+
+    # Walk the focused view and apply all protections
+    protected = _walk_and_protect(focused)
+
+    return protected, security_issues
 
 
 # ---------------------------------------------------------------------------
-# API call
+# DeepSeek API call (via OpenAI SDK)
 # ---------------------------------------------------------------------------
 
-def call_anthropic(system: str, user: str, api_key: str,
-                   model: str = "claude-sonnet-4-20250514",
-                   max_tokens: int = 4096,
-                   timeout: int = 120) -> Optional[dict]:
-    """Call the Anthropic Messages API and return parsed JSON."""
+def call_deepseek(system: str, user: str, api_key: str,
+                  model: str = "deepseek-v4-pro",
+                  timeout: int = 180) -> Optional[dict]:
+    """Call DeepSeek API (OpenAI-compatible) and return parsed JSON."""
     try:
-        import anthropic
+        from openai import OpenAI
     except ImportError:
         return {
-            "summary": "AI analysis skipped: anthropic package not installed",
+            "summary": "AI analysis skipped: openai package not installed",
             "issues": [{
                 "severity": "notice",
                 "path": "$",
-                "message": "AI 语义分析不可用：anthropic 包未安装 (pip install anthropic)",
-                "suggestion": "在 CI 环境中安装 anthropic 包以启用 AI 分析"
+                "message": "AI 语义分析不可用：openai 包未安装 (pip install openai)",
+                "suggestion": "在 CI 环境中安装 openai 包以启用 AI 分析"
             }]
         }
 
     try:
-        client = anthropic.Anthropic(api_key=api_key, timeout=timeout)
-        message = client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            temperature=0,
-            system=system,
-            messages=[{"role": "user", "content": user}],
+        client = OpenAI(
+            api_key=api_key,
+            base_url="https://api.deepseek.com",
+            timeout=timeout,
         )
 
-        # Extract text from response
-        text = ""
-        for block in message.content:
-            if hasattr(block, "text"):
-                text += block.text
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            stream=False,
+            reasoning_effort="high",
+            extra_body={"thinking": {"type": "enabled"}},
+        )
+
+        text = response.choices[0].message.content or ""
 
         # Parse JSON from response (strip possible markdown fences)
         text = text.strip()
         if text.startswith("```"):
-            # Remove ```json ... ``` or ``` ... ```
             lines = text.split("\n")
             if lines[0].startswith("```"):
                 lines = lines[1:]
             if lines and lines[-1].startswith("```"):
                 lines = lines[:-1]
             text = "\n".join(lines)
+
+        # Try to find JSON object in the text (DeepSeek with thinking may
+        # output reasoning before the JSON)
+        # Look for the first { and last }
+        first_brace = text.find("{")
+        last_brace = text.rfind("}")
+        if first_brace >= 0 and last_brace > first_brace:
+            text = text[first_brace:last_brace + 1]
 
         return json.loads(text)
 
@@ -204,40 +411,63 @@ def call_anthropic(system: str, user: str, api_key: str,
             "issues": [{
                 "severity": "notice",
                 "path": "$",
-                "message": f"AI 返回的内容无法解析为 JSON: {e}",
+                "message": f"DeepSeek 返回的内容无法解析为 JSON: {e}",
                 "suggestion": "重试或手动检查报告"
             }],
-            "_raw_response": text[:500],
-        }
-    except anthropic.APIError as e:
-        return {
-            "summary": f"Anthropic API error: {e}",
-            "issues": [{
-                "severity": "notice",
-                "path": "$",
-                "message": f"Anthropic API 调用失败: {e}",
-                "suggestion": "检查 API key 是否有效、网络是否可达"
-            }]
+            "_raw_response": text[:500] if 'text' in dir() else "",
         }
     except Exception as e:
-        return {
-            "summary": f"AI analysis failed: {e}",
-            "issues": [{
-                "severity": "notice",
-                "path": "$",
-                "message": f"AI 语义分析异常: {type(e).__name__}: {e}",
-                "suggestion": "检查 AI 服务状态或稍后重试"
-            }]
-        }
+        error_name = type(e).__name__
+        error_msg = str(e)
+        # Detect common error patterns
+        if "401" in error_msg or "Unauthorized" in error_msg or "auth" in error_msg.lower():
+            return {
+                "summary": f"DeepSeek API authentication failed: {error_msg}",
+                "issues": [{
+                    "severity": "notice",
+                    "path": "$",
+                    "message": f"DeepSeek API 认证失败: {error_msg}",
+                    "suggestion": "检查 DEEPSEEK_API_KEY 是否有效"
+                }]
+            }
+        elif "429" in error_msg or "rate" in error_msg.lower():
+            return {
+                "summary": f"DeepSeek API rate limited: {error_msg}",
+                "issues": [{
+                    "severity": "notice",
+                    "path": "$",
+                    "message": f"DeepSeek API 速率限制: {error_msg}",
+                    "suggestion": "稍后重试或降低请求频率"
+                }]
+            }
+        elif "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
+            return {
+                "summary": f"DeepSeek API timeout: {error_msg}",
+                "issues": [{
+                    "severity": "notice",
+                    "path": "$",
+                    "message": f"DeepSeek API 超时: {error_msg}",
+                    "suggestion": "文件较大或服务繁忙，稍后重试"
+                }]
+            }
+        else:
+            return {
+                "summary": f"AI analysis failed: {error_name}: {error_msg}",
+                "issues": [{
+                    "severity": "notice",
+                    "path": "$",
+                    "message": f"AI 语义分析异常: {error_name}: {error_msg}",
+                    "suggestion": "检查 DeepSeek API 服务状态或稍后重试"
+                }]
+            }
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Main logic
 # ---------------------------------------------------------------------------
 
 def analyze_file(filepath: str, api_key: str) -> Dict[str, Any]:
-    """Run AI semantic analysis on a single JSON file."""
-    issues = []
+    """Run AI semantic analysis on a single JSON file with full protection."""
 
     if not os.path.isfile(filepath):
         return {
@@ -247,51 +477,124 @@ def analyze_file(filepath: str, api_key: str) -> Dict[str, Any]:
                         "message": f"File not found: {filepath}"}]
         }
 
+    # --- Protection Layer 1: File size check ---
+    size_error = check_file_size(filepath)
+    if size_error:
+        return {
+            "file": filepath,
+            "pass": False,
+            "issues": [{"severity": "error", "path": "$",
+                        "message": f"Token-bomb protection: {size_error}"}]
+        }
+
+    # --- Protection Layer 2: Parse JSON ---
     try:
         with open(filepath, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            raw_text = f.read()
     except Exception as e:
         return {
             "file": filepath,
             "pass": True,
             "issues": [{"severity": "error", "path": "$",
-                        "message": f"Cannot parse JSON: {e}"}]
+                        "message": f"Cannot read file: {e}"}]
         }
 
-    # Build prompt and call API
-    user_prompt = build_user_prompt(filepath, data)
-    result = call_anthropic(SYSTEM_PROMPT, user_prompt, api_key)
+    # Check raw text size (before parsing, catch bombs that exploit streaming parsers)
+    if len(raw_text) > MAX_FILE_SIZE_BYTES * 2:
+        return {
+            "file": filepath,
+            "pass": False,
+            "issues": [{"severity": "error", "path": "$",
+                        "message": f"Token-bomb protection: raw file size "
+                                   f"({len(raw_text) / 1_000_000:.1f}MB) exceeds limit"}]
+        }
+
+    try:
+        data = json.loads(raw_text)
+    except json.JSONDecodeError as e:
+        return {
+            "file": filepath,
+            "pass": True,
+            "issues": [{"severity": "error", "path": "$",
+                        "message": f"Cannot parse JSON: {e.msg} at line {e.lineno}"}]
+        }
+
+    # --- Protection Layer 3: Build safe focused view (scan + truncate) ---
+    focused, security_issues = build_safe_focused_view(data, filepath)
+
+    # --- Protection Layer 4: Token budget check ---
+    user_prompt = (
+        f"请分析以下验证报告 JSON 的语义质量问题：\n\n"
+        f"文件: {filepath}\n\n"
+        f"{json.dumps(focused, indent=2, ensure_ascii=False)}"
+    )
+    estimated_tokens = estimate_tokens(SYSTEM_PROMPT) + estimate_tokens(user_prompt)
+
+    if estimated_tokens > MAX_ESTIMATED_TOKENS:
+        return {
+            "file": filepath,
+            "pass": False,
+            "issues": security_issues + [{
+                "severity": "error",
+                "path": "$",
+                "message": f"Token-bomb protection: estimated prompt size "
+                           f"({estimated_tokens} tokens) exceeds AI analysis limit "
+                           f"({MAX_ESTIMATED_TOKENS})",
+                "suggestion": "报告内容过大，请检查是否被注入了膨胀数据"
+            }]
+        }
+
+    # Also check the total character count of the focused content
+    focused_json_str = json.dumps(focused, ensure_ascii=False)
+    if len(focused_json_str) > MAX_FOCUSED_CONTENT_CHARS:
+        # Truncate the focused content aggressively
+        return {
+            "file": filepath,
+            "pass": False,
+            "issues": security_issues + [{
+                "severity": "error",
+                "path": "$",
+                "message": f"Token-bomb protection: focused content size "
+                           f"({len(focused_json_str) / 1_000:.0f}K chars) exceeds limit "
+                           f"({MAX_FOCUSED_CONTENT_CHARS / 1_000:.0f}K)",
+                "suggestion": "报告内容过大，请检查是否有异常的数据膨胀"
+            }]
+        }
+
+    # --- Call DeepSeek API ---
+    result = call_deepseek(SYSTEM_PROMPT, user_prompt, api_key)
 
     if result is None:
-        result = {
-            "summary": "AI analysis returned no result",
-            "issues": [],
-        }
+        result = {"summary": "AI analysis returned no result", "issues": []}
 
-    issues = result.get("issues", [])
-    has_ai_errors = any(
-        i.get("severity") == "warning" for i in issues
-    )
+    # Merge security issues from protection layer with AI findings
+    ai_issues = result.get("issues", [])
+    all_issues = security_issues + ai_issues
 
     return {
         "file": filepath,
-        "pass": True,  # AI analysis is advisory, never a hard failure
+        "pass": True,  # AI analysis is advisory
         "ai_summary": result.get("summary", ""),
-        "issues": issues,
+        "issues": all_issues,
+        "_meta": {
+            "estimated_tokens": estimated_tokens,
+            "focused_chars": len(focused_json_str),
+        },
     }
 
 
 def main():
     if len(sys.argv) < 2:
-        print(json.dumps({"error": "Usage: ai_quality_check.py <file1.json> [file2.json ...]"},
-                         indent=2, ensure_ascii=False))
+        print(json.dumps(
+            {"error": "Usage: ai_quality_check.py <file1.json> [file2.json ...]"},
+            indent=2, ensure_ascii=False))
         sys.exit(2)
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    api_key = os.environ.get("DEEPSEEK_API_KEY", "")
     if not api_key:
         print(json.dumps({
             "pass": True,
-            "error": "ANTHROPIC_API_KEY not set. Set the environment variable to enable AI analysis.",
+            "error": "DEEPSEEK_API_KEY not set. Set the environment variable to enable AI analysis.",
             "files": {
                 f: {
                     "file": f,
@@ -299,8 +602,8 @@ def main():
                     "issues": [{
                         "severity": "notice",
                         "path": "$",
-                        "message": "AI 语义分析跳过：未设置 ANTHROPIC_API_KEY 环境变量",
-                        "suggestion": "在 GitHub Secrets 中配置 ANTHROPIC_API_KEY 以启用 AI 分析"
+                        "message": "AI 语义分析跳过：未设置 DEEPSEEK_API_KEY 环境变量",
+                        "suggestion": "在 GitHub Secrets 中配置 DEEPSEEK_API_KEY 以启用 AI 分析"
                     }]
                 }
                 for f in sys.argv[1:]

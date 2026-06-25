@@ -32,7 +32,7 @@
 # 确定性检查
 python scripts/validate_json.py reports/*.json
 
-# AI 语义分析（需要 ANTHROPIC_API_KEY 环境变量）
+# AI 语义分析（需要 DEEPSEEK_API_KEY 环境变量）
 python scripts/ai_quality_check.py reports/<filename>.json
 
 # 或通过 Claude Code 调用

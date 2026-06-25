@@ -94,4 +94,19 @@ https://github.com/computing-TTFHW/ttfhw-report/blob/master/.claude/skills/ttfhw
 
 ## 环境变量
 
-- `ANTHROPIC_API_KEY` — 可选，设置后启用 AI 语义分析。未设置时 AI 分析自动跳过。
+- `DEEPSEEK_API_KEY` — 可选，设置后启用 DeepSeek v4-pro AI 语义分析。未设置时 AI 分析自动跳过。
+
+## AI 模型
+
+使用 DeepSeek v4-pro（via OpenAI SDK 兼容接口），启用 reasoning_effort="high" + thinking 模式，提供更深入的中文语义分析。
+
+## Token 注入防护
+
+AI 分析脚本 (`ai_quality_check.py`) 内置多层注入防护：
+
+1. **文件大小限制** — 拒绝超过 1MB 的文件
+2. **字符串长度截断** — 超过 50000 字符的单个值会被截断
+3. **提示词注入检测** — 检测 "ignore previous instructions"、系统提示词覆盖、角色劫持等 7 类注入模式
+4. **Token 炸弹检测** — 通过 zlib 压缩比识别重复填充内容
+5. **总 Token 预算** — 预估超过 30000 token 时拒绝分析
+6. **数组长度限制** — 超过 500 项的数组截断处理
