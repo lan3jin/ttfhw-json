@@ -105,9 +105,11 @@ jobs:
                 else if (issue.severity === 'warning') totalWarnings++;
                 else totalNotices++;
 
-                // Create check run annotation
+                // Create check run annotation (start_line/end_line required by GitHub API)
                 const annotation = {
                   path: file,
+                  start_line: 1,
+                  end_line: 1,
                   annotation_level: issue.severity === 'error' ? 'failure' :
                                     issue.severity === 'warning' ? 'warning' : 'notice',
                   title: issue.path || '$',
