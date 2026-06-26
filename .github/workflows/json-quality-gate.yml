@@ -75,24 +75,6 @@ jobs:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         run: |
           python3 ../base/scripts/ai_quality_check.py ${{ steps.changed-files.outputs.all_changed_files }} > /tmp/ai_results.json
-          echo "::group::AI Token Usage"
-          python3 -c "
-          import json
-          with open('/tmp/ai_results.json') as f:
-              d = json.load(f)
-          for path, info in d.get('files', {}).items():
-              meta = info.get('_meta', {})
-              est = meta.get('estimated_tokens', '?')
-              usage = meta.get('actual_usage', {})
-              prompt = usage.get('prompt_tokens', '?')
-              completion = usage.get('completion_tokens', '?')
-              total = usage.get('total_tokens', '?')
-              reasoning = usage.get('reasoning_tokens', 0)
-              extra = f', 推理={reasoning}' if reasoning else ''
-              name = path.split('/')[-1][:60]
-              print(f'{name}: 预估={est}, 实际=输入{prompt}+输出{completion}=合计{total}{extra}')
-          "
-          echo "::endgroup::"
           cat /tmp/ai_results.json
 
       - name: Post results as Check Run and PR comment
@@ -262,3 +244,47 @@ jobs:
                 body: commentBody,
               });
             }
+      # Write workflow summary with token usage
+      - name: Write workflow summary
+        if: steps.changed-files.outputs.any_changed == 'true'
+        run: |
+          {
+            echo "## JSON 质量门禁"
+            echo ""
+            echo "| 文件 | 检查结果 | DeepSeek Token |"
+            echo "|------|---------|---------------|"
+            python3 -c "
+          import json
+          with open('/tmp/deterministic_results.json') as f:
+              det = json.load(f)
+          ai_avail = False
+          try:
+              with open('/tmp/ai_results.json') as f:
+                  ai = json.load(f)
+              ai_avail = not ai.get('error')
+          except: pass
+          for path, info in sorted(det.get('files', {}).items()):
+              name = path.split('/')[-1][:55]
+              issues = info.get('issues', [])
+              errors = sum(1 for i in issues if i.get('severity') == 'error')
+              warnings = sum(1 for i in issues if i.get('severity') == 'warning')
+              notices = sum(1 for i in issues if i.get('severity') == 'notice')
+              if errors: status = f'🚫 {errors}E'
+              elif warnings: status = f'⚠️ {warnings}W'
+              elif notices: status = f'ℹ️ {notices}N'
+              else: status = '✅ 通过'
+              token_str = '-'
+              if ai_avail:
+                  ai_info = ai.get('files', {}).get(path, {})
+                  meta = ai_info.get('_meta', {})
+                  usage = meta.get('actual_usage', {})
+                  total = usage.get('total_tokens', '?')
+                  reasoning = usage.get('reasoning_tokens', 0)
+                  token_str = f'合计 {total}'
+                  if reasoning: token_str += f' (推理 {reasoning})'
+              print(f'| {name} | {status} | {token_str} |')
+          " 2>/dev/null || echo "| - | 结果解析失败 | - |"
+            echo ""
+            echo "---"
+            echo "🤖 由 [JSON 质量门禁](https://github.com/${{ github.repository }}/actions) 自动生成"
+          } >> "$GITHUB_STEP_SUMMARY"
