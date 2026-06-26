@@ -75,6 +75,24 @@ jobs:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         run: |
           python3 ../base/scripts/ai_quality_check.py ${{ steps.changed-files.outputs.all_changed_files }} > /tmp/ai_results.json
+          echo "::group::AI Token Usage"
+          python3 -c "
+          import json
+          with open('/tmp/ai_results.json') as f:
+              d = json.load(f)
+          for path, info in d.get('files', {}).items():
+              meta = info.get('_meta', {})
+              est = meta.get('estimated_tokens', '?')
+              usage = meta.get('actual_usage', {})
+              prompt = usage.get('prompt_tokens', '?')
+              completion = usage.get('completion_tokens', '?')
+              total = usage.get('total_tokens', '?')
+              reasoning = usage.get('reasoning_tokens', 0)
+              extra = f', 推理={reasoning}' if reasoning else ''
+              name = path.split('/')[-1][:60]
+              print(f'{name}: 预估={est}, 实际=输入{prompt}+输出{completion}=合计{total}{extra}')
+          "
+          echo "::endgroup::"
           cat /tmp/ai_results.json
 
       - name: Post results as Check Run and PR comment

@@ -383,6 +383,19 @@ def call_deepseek(system: str, user: str, api_key: str,
             extra_body={"thinking": {"type": "enabled"}},
         )
 
+        # Extract token usage for cost monitoring
+        usage = {}
+        if hasattr(response, 'usage') and response.usage:
+            usage = {
+                "prompt_tokens": getattr(response.usage, 'prompt_tokens', 0),
+                "completion_tokens": getattr(response.usage, 'completion_tokens', 0),
+                "total_tokens": getattr(response.usage, 'total_tokens', 0),
+            }
+            # DeepSeek thinking model: reasoning tokens
+            if hasattr(response.usage, 'completion_tokens_details') and response.usage.completion_tokens_details:
+                usage["reasoning_tokens"] = getattr(
+                    response.usage.completion_tokens_details, 'reasoning_tokens', 0)
+
         text = response.choices[0].message.content or ""
 
         # Parse JSON from response (strip possible markdown fences)
@@ -403,7 +416,18 @@ def call_deepseek(system: str, user: str, api_key: str,
         if first_brace >= 0 and last_brace > first_brace:
             text = text[first_brace:last_brace + 1]
 
-        return json.loads(text)
+        result = json.loads(text)
+        result["_usage"] = usage
+
+        # Log token usage to stderr for CI visibility
+        reasoning_info = f", 推理={usage.get('reasoning_tokens', 0)}" if 'reasoning_tokens' in usage else ""
+        import sys as _sys
+        print(f"[DeepSeek Token] 输入={usage.get('prompt_tokens', '?')}, "
+              f"输出={usage.get('completion_tokens', '?')}, "
+              f"合计={usage.get('total_tokens', '?')}{reasoning_info}",
+              file=_sys.stderr)
+
+        return result
 
     except json.JSONDecodeError as e:
         return {
@@ -570,6 +594,8 @@ def analyze_file(filepath: str, api_key: str) -> Dict[str, Any]:
     # Merge security issues from protection layer with AI findings
     ai_issues = result.get("issues", [])
     all_issues = security_issues + ai_issues
+    # Extract actual token usage from API response
+    actual_usage = result.get("_usage", {})
 
     return {
         "file": filepath,
@@ -579,6 +605,7 @@ def analyze_file(filepath: str, api_key: str) -> Dict[str, Any]:
         "_meta": {
             "estimated_tokens": estimated_tokens,
             "focused_chars": len(focused_json_str),
+            "actual_usage": actual_usage,
         },
     }
 
